@@ -67,8 +67,8 @@ const handleOPTIONS = async () => {
 const BASE_URL = "https://generativelanguage.googleapis.com";
 const API_VERSION = "v1beta";
 
-// https://github.com/google-gemini/generative-ai-js/blob/cf223ff4a1ee5a2d944c53cddb8976136382bee6/src/requests/request.ts#L71
-const API_CLIENT = "genai-js/0.21.0"; // npm view @google/generative-ai version
+// https://github.com/googleapis/js-genai/blob/main/src/_api_client.ts#L18
+const API_CLIENT = "google-genai-sdk/1.28.0"; // npm view @google/genai version
 const makeHeaders = (apiKey, more) => ({
   "x-goog-api-client": API_CLIENT,
   ...(apiKey && { "x-goog-api-key": apiKey }),
@@ -95,29 +95,32 @@ async function handleModels (apiKey) {
   return new Response(body, fixCors(response));
 }
 
-const DEFAULT_EMBEDDINGS_MODEL = "text-embedding-004";
+const DEFAULT_EMBEDDINGS_MODEL = "gemini-embedding-001";
 async function handleEmbeddings (req, apiKey) {
-  if (typeof req.model !== "string") {
-    throw new HttpError("model is not specified", 400);
+  let modelFull, model;
+  switch (true) {
+    case typeof req.model !== "string":
+      throw new HttpError("model is not specified", 400);
+    case req.model.startsWith("models/"):
+      modelFull = req.model;
+      model = modelFull.substring(7);
+      break;
+    case req.model.startsWith("gemini-"):
+      model = req.model;
+      break;
+    default:
+      model = DEFAULT_EMBEDDINGS_MODEL;
   }
-  let model;
-  if (req.model.startsWith("models/")) {
-    model = req.model;
-  } else {
-    if (!req.model.startsWith("gemini-")) {
-      req.model = DEFAULT_EMBEDDINGS_MODEL;
-    }
-    model = "models/" + req.model;
-  }
+  modelFull = modelFull ?? "models/" + model;
   if (!Array.isArray(req.input)) {
     req.input = [ req.input ];
   }
-  const response = await fetch(`${BASE_URL}/${API_VERSION}/${model}:batchEmbedContents`, {
+  const response = await fetch(`${BASE_URL}/${API_VERSION}/${modelFull}:batchEmbedContents`, {
     method: "POST",
     headers: makeHeaders(apiKey, { "Content-Type": "application/json" }),
     body: JSON.stringify({
       "requests": req.input.map(text => ({
-        model,
+        model: modelFull,
         content: { parts: { text } },
         outputDimensionality: req.dimensions,
       }))
@@ -133,15 +136,15 @@ async function handleEmbeddings (req, apiKey) {
         index,
         embedding: values,
       })),
-      model: req.model,
+      model,
     }, null, "  ");
   }
   return new Response(body, fixCors(response));
 }
 
-const DEFAULT_MODEL = "gemini-2.0-flash";
+const DEFAULT_MODEL = "gemini-flash-latest";
 async function handleCompletions (req, apiKey) {
-  let model = DEFAULT_MODEL;
+  let model;
   switch (true) {
     case typeof req.model !== "string":
       break;
@@ -153,12 +156,25 @@ async function handleCompletions (req, apiKey) {
     case req.model.startsWith("learnlm-"):
       model = req.model;
   }
+  model = model || DEFAULT_MODEL;
   let body = await transformRequest(req);
+  const extra = req.extra_body?.google;
+  if (extra) {
+    if (extra.safety_settings) {
+      body.safetySettings = extra.safety_settings;
+    }
+    if (extra.cached_content) {
+      body.cachedContent = extra.cached_content;
+    }
+    if (extra.thinking_config) {
+      body.generationConfig.thinkingConfig = extra.thinking_config;
+    }
+  }
   switch (true) {
     case model.endsWith(":search"):
-      model = model.substring(0, model.length - 7);
+      model = model.slice(0,-7);
       // eslint-disable-next-line no-fallthrough
-    case req.model.endsWith("-search-preview"):
+    case req.model?.includes("-search-preview"):
       body.tools = body.tools || [];
       body.tools.push({googleSearch: {}});
   }
@@ -225,6 +241,7 @@ const adjustProps = (schemaPart) => {
 const adjustSchema = (schema) => {
   const obj = schema[schema.type];
   delete obj.strict;
+  delete obj.parameters?.$schema;
   return adjustProps(schema);
 };
 
@@ -250,6 +267,13 @@ const fieldsMap = {
   temperature: "temperature",
   top_k: "topK", // non-standard
   top_p: "topP",
+};
+const thinkingBudgetMap = {
+  none: 0,
+  //minimal: 0,
+  low: 1024,
+  medium: 8192,
+  high: 24576,
 };
 const transformConfig = (req) => {
   let cfg = {};
@@ -279,6 +303,9 @@ const transformConfig = (req) => {
       default:
         throw new HttpError("Unsupported response_format.type", 400);
     }
+  }
+  if (req.reasoning_effort) {
+    cfg.thinkingConfig = { thinkingBudget: thinkingBudgetMap[req.reasoning_effort] };
   }
   return cfg;
 };
@@ -525,10 +552,25 @@ const transformCandidates = (key, cand) => {
 const transformCandidatesMessage = transformCandidates.bind(null, "message");
 const transformCandidatesDelta = transformCandidates.bind(null, "delta");
 
+const notEmpty = (el) => Object.values(el).some(Boolean) ? el : undefined;
+const sum = (...numbers) => numbers.reduce((total, num) => total + (num ?? 0), 0);
 const transformUsage = (data) => ({
-  completion_tokens: data.candidatesTokenCount,
+  completion_tokens: sum(data.candidatesTokenCount, data.toolUsePromptTokenCount, data.thoughtsTokenCount),
   prompt_tokens: data.promptTokenCount,
-  total_tokens: data.totalTokenCount
+  total_tokens: data.totalTokenCount,
+  completion_tokens_details: notEmpty({
+    audio_tokens: data.candidatesTokensDetails
+      ?.find(el => el.modality === "AUDIO")
+      ?.tokenCount,
+    reasoning_tokens: data.thoughtsTokenCount,
+  }),
+  prompt_tokens_details: notEmpty({
+    audio_tokens: data.promptTokensDetails
+      ?.find(el => el.modality === "AUDIO")
+      ?.tokenCount,
+    cached_tokens: data.cacheTokensDetails
+      ?.reduce((acc,el) => acc + el.tokenCount, 0),
+  }),
 });
 
 const checkPromptBlock = (choices, promptFeedback, key) => {
